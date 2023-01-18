@@ -1,0 +1,283 @@
+## --------------------------------------------------------------------------------- ##
+
+## --------------------------------------------------------------------------------- ##
+# R options
+g <- gc(reset = T); rm(list = ls()) # Empty garbage collector
+# .rs.restartR()                    # Restart R session
+options(warn = -1, scipen = 999)    # Remove warning alerts and scientific notation
+suppressMessages(library(pacman))
+suppressMessages(pacman::p_load(tidyverse, terra, lubridate, gtools, sf, furrr, future, 
+                                foreach, doParallel, doMPI, doSNOW, stringr, rgdal, rgeos, stringr))
+## --------------------------------------------------------------------------------- ##
+
+OSys <<- Sys.info()[1]
+root <<- switch(OSys,
+                'Linux'   = '/catalogue/WFP_ClimateRiskPr1',
+                'Windows' = '//CATALOGUE/WFP_ClimateRiskPr1') 
+#==
+root1 <<- switch(OSys,
+                'Linux'   = '/CATALOGUE/Workspace14/WFP_ClimateRiskPr',
+                'Windows' = '//CATALOGUE/Workspace14/WFP_ClimateRiskPr') 
+
+## --------------------------------------------------------------------------------- ##
+gcm <- 'EC-Earth3-Veg' # ACCESS-ESM1-5, EC-Earth3-Veg, INM-CM5-0, MPI-ESM1-2-HR, MRI-ESM2-0
+ssp <- 'ssp585' # ssp126, ssp245, ssp370, ssp585
+var <- 'pr' # pr, tasmax, tasmin
+prd <- c(2021, 2040)
+periodo <- ('2030s') # 2050s
+
+AFR <- raster::shapefile(paste0(root,"/1.Data/shps/world_shapefile/Africa/africa.shp"))
+iso <- unique(c(AFR@data$ISO3))
+iso <- iso[-c(20,34,35,41,43)]
+iso <- c(iso, "SSD" )
+## --------------------------------------------------------------------------------- ##
+bc_delta <- function(gcm, var, prd, iso, outf){
+  
+  outf <- paste0(root, '/10.New_Results/bias_corrected/',periodo,'/',iso,'/',ssp,'/',gcm); if(!dir.exists(outf)){dir.create(outf, F, T)}
+  cat(paste0('Processing: model ',gcm,', variable ',var,', future period ',prd[1],'-',prd[2],' in ',iso,'\n'))
+  
+  ## --------------------------------------------------------------------------------- ##
+  ## Baseline
+  ## --------------------------------------------------------------------------------- ##
+  
+  # Lists all the historical files
+  bsl <- c(1995, 2014)
+  fls <- list.files(path = paste0(root1,'/1.Data/climate/CMIP6/download_data/', ssp, '/', gcm), pattern = gcm, full.names = T)
+  fls_his <- grep(pattern = 'historical', x = fls, value = T)
+  fls_his <- grep(pattern = var, x = fls_his, value = T)
+  
+  # Identify the right files
+  dts <- strsplit(x = fls_his, split = '_gn_|_gr_|_gr[0-9]_') %>% purrr::map(2) %>% as.character()
+  dts <- gsub(pattern = '.nc', replacement = '', x = dts, fixed = T)
+  dts <- strsplit(x = dts, split = '-')
+  ini <- dts %>% purrr::map(.f = function(vct){
+    vct <- as.Date(vct, "%Y%m%d")
+    chck <- as.Date('1995-01-01') %within% lubridate::interval(vct[1], vct[2])
+    return(chck)
+  }) %>% unlist() %>% which()
+  end <- dts %>% purrr::map(.f = function(vct){
+    vct <- as.Date(vct, "%Y%m%d")
+    chck <- as.Date('2014-12-31') %within% lubridate::interval(vct[1], vct[2])
+    return(chck)
+  }) %>% unlist() %>% which()
+  
+  # Load the right files
+  fls_his <- fls_his[ini:end]
+  gcm_his <- fls_his %>%
+    purrr::map(.f = function(fl){
+      gcm <- terra::rast(fl)
+      gcm <- gcm[[lubridate::year(terra::time(gcm)) %in% 1995:2014]]
+      return(gcm)
+    }) %>% terra::rast()
+  
+  ## --------------------------------------------------------------------------------- ##
+  ## Future period
+  ## --------------------------------------------------------------------------------- ##
+  
+  # Lists all the future files
+  fls <- list.files(path = paste0(root1,'/1.Data/climate/CMIP6/download_data/',ssp,'/',gcm), pattern = gcm, full.names = T)
+  fls_fut <- grep(pattern = ssp, x = fls, value = T)
+  fls_fut <- grep(pattern = var, x = fls_fut, value = T)
+  
+  # Identify the right files
+  dts <- strsplit(x = fls_fut, split = '_gn_|_gr_|_gr[0-9]_') %>% purrr::map(2) %>% as.character()
+  dts <- gsub(pattern = '.nc', replacement = '', x = dts, fixed = T)
+  dts <- strsplit(x = dts, split = '-')
+  ini <- dts %>% purrr::map(.f = function(vct){
+    vct <- as.Date(vct, "%Y%m%d")
+    chck <- as.Date(paste0(prd[1],'-01-01')) %within% lubridate::interval(vct[1], vct[2])
+    return(chck)
+  }) %>% unlist() %>% which()
+  end <- dts %>% purrr::map(.f = function(vct){
+    vct <- as.Date(vct, "%Y%m%d")
+    chck <- as.Date(paste0(prd[2],'-01-01')) %within% lubridate::interval(vct[1], vct[2])
+    return(chck)
+  }) %>% unlist() %>% which()
+  
+  # Load the right files
+  fls_fut <- fls_fut[ini:end]
+  gcm_fut <- fls_fut %>%
+    purrr::map(.f = function(fl){
+      gcm <- terra::rast(fl)
+      gcm <- gcm[[lubridate::year(terra::time(gcm)) %in% prd[1]:prd[2]]]
+      return(gcm)
+    }) %>% terra::rast()
+  
+  # Country mask
+  shp <- terra::vect(paste0(root1,'/1.Data/shps/country_africa','/',iso,'/', iso, '.shp'))
+  
+  result <- 1:12 %>%
+    purrr::map(.f = function(mnth){
+      
+      cat(paste0('Processing month: ',mnth,'\n'))
+      
+      ## Compute monthly statistics for historical period
+      # Days within the month
+      cnd <- lubridate::month(terra::time(gcm_his)) == mnth
+      yrs_dts <<- split(terra::time(gcm_his)[cnd],cumsum(c(1,diff(terra::time(gcm_his)[cnd])!=1)))
+      
+      his_stack <- yrs_dts %>%
+        purrr::map(.f = function(flt){
+          if(var %in% c('tasmax','tasmin')){
+            avg <- mean(gcm_his[[terra::time(gcm_his) %in% flt]])
+          } else {
+            avg <- sum(gcm_his[[terra::time(gcm_his) %in% flt]])
+          }
+          return(avg)
+        })
+      his_stack <- terra::rast(his_stack)
+      avg_his <- mean(his_stack)
+      
+      ## Compute monthly statistics for future period
+      # Days within the month
+      cnd <- lubridate::month(terra::time(gcm_fut)) == mnth # Days within the month
+      yrs_dts <- split(terra::time(gcm_fut)[cnd],cumsum(c(1,diff(terra::time(gcm_fut)[cnd])!=1)))
+      
+      fut_stack <- yrs_dts %>%
+        purrr::map(.f = function(flt){
+          if(var %in% c('tasmax','tasmin')){
+            avg <- mean(gcm_fut[[terra::time(gcm_fut) %in% flt]])
+          } else {
+            avg <- sum(gcm_fut[[terra::time(gcm_fut) %in% flt]])
+          }
+          return(avg)
+        })
+      fut_stack <- terra::rast(fut_stack)
+      avg_fut <- mean(fut_stack)
+      
+      if(var %in% c('tasmax','tasmin')){
+        avg_his <- avg_his - 273.15
+        avg_fut <- avg_fut - 273.15
+      } else {
+        avg_his <- avg_his * 86400
+        avg_fut <- avg_fut * 86400
+        avg_his[avg_his < 0] <- 0
+        avg_fut[avg_fut < 0] <- 0
+      }
+      
+      avg_his <- terra::rotate(avg_his)
+      avg_fut <- terra::rotate(avg_fut)
+      
+      if(var %in% c('tasmax','tasmin')){
+        anom <- avg_fut - avg_his
+      } else {
+        anom <- (avg_fut - avg_his)/avg_his
+        # Truncate the top 2% of anomaly values
+        thr <- as.numeric(terra::global(x = anom, fun = stats::quantile, probs = 0.98, na.rm = T))
+        anom[anom >= thr] <- thr
+      }
+      
+      anom <- anom %>% terra::crop(terra::ext(shp), snap = 'out')#  %>% terra::mask(shp, touches = T)
+      
+      crds <- anom %>% terra::as.data.frame(xy = T)
+      
+      empty <- anom
+      terra::values(empty) <- NA
+      
+      anomalies_values <- unique(crds[,'mean'])
+      
+      tps  <- fields::Tps(x = crds[,c('x','y')], Y = crds[,'mean'])
+      
+      ref <- terra::rast(paste0(root1,"/1.Data/chirps-v2.0.2020.01.01.tif"))
+      ref <- ref %>% terra::crop(terra::ext(shp), snap = 'out') %>% terra::mask(shp, touches = T)
+      
+      intp <- raster::interpolate(raster::raster(ref), tps)
+      intp <- terra::rast(intp) %>% terra::mask(mask = ref)
+      
+      era5Dir <- paste0(root1,'/1.Data/Chirts')
+      chrpDir <- paste0(root1,'/1.Data/Chirps')
+      
+      ## Dates filter
+      di <- as.Date('1995-01-01')
+      df <- as.Date('2014-12-31')
+      dts <- seq(from = di, to = df, by = 'day'); rm(di, df)
+      
+      if(var == 'tasmin'){
+        obs_pth <- paste0(era5Dir,'/Tmin')
+      } else {
+        if(var == 'tasmax'){
+          obs_pth <- paste0(era5Dir,'/Tmax')
+        } else {
+          if(var == 'pr'){
+            obs_pth <- chrpDir
+          }
+        }
+      }
+      
+      if(var %in% c('tasmin','tasmax')){
+        obs_fls <- gtools::mixedsort(list.files(obs_pth, pattern = '*.tif$', full.names = T))
+        obs_dts <- strsplit(x = obs_fls, split = 'chirts-v2.0.', fixed = T) %>% purrr::map(2) %>% unlist()
+        obs_dts <- strsplit(x = obs_dts, split = '.tif', fixed = T) %>% purrr::map(1) %>% unlist()
+        obs_dts <- as.Date(gsub('.', '-', obs_dts, fixed = T))
+        # obs_dts <- as.Date(obs_dts, "%Y%m%d")
+        obs_fls <- obs_fls[lubridate::year(obs_dts) %in% 1995:2014]
+        obs_dts <- obs_dts[lubridate::year(obs_dts) %in% 1995:2014]
+      } else {
+        obs_fls <- gtools::mixedsort(list.files(obs_pth, pattern = '*.tif$', full.names = T))
+        obs_dts <- strsplit(x = obs_fls, split = 'chirps-v2.0.', fixed = T) %>% purrr::map(2) %>% unlist()
+        obs_dts <- strsplit(x = obs_dts, split = '.tif', fixed = T) %>% purrr::map(1) %>% unlist()
+        obs_dts <- as.Date(gsub('.', '-', obs_dts, fixed = T))
+        obs_fls <- obs_fls[obs_dts %in% dts]
+        obs_dts <- obs_dts[obs_dts %in% dts]
+      }
+      
+      # Days within the season
+      cnd <- lubridate::month(obs_dts) == mnth
+      yrs_dts <- split(obs_dts[cnd],cumsum(c(1,diff(obs_dts[cnd])!=1)))
+      
+      fut_ds_bc <- yrs_dts %>%
+        purrr::map(.f = function(flt){
+          
+          obs <- terra::rast(obs_fls[obs_dts %in% flt])
+          terra::time(obs) <- as.Date(flt)
+          obs <- obs %>% terra::crop(terra::ext(shp), snap = 'out') %>% terra::mask(shp, touches = T)
+          obs[obs == -9999] <- NA
+          if(var %in% c('tasmin','tasmax')){
+            obs <- obs
+          }
+          obs <- terra::resample(x = obs, y = ref)
+          
+          if(var %in% c('tasmin','tasmax')){
+            fut_ds_bc <- obs + intp
+          } else {
+            fut_ds_bc <- obs * (1 + intp)
+            fut_ds_bc[fut_ds_bc < 0] <- 0 # Deal with negative values
+          }
+          return(fut_ds_bc)
+          
+        }) %>% terra::rast()
+      
+      return(fut_ds_bc)
+      
+    }) %>%
+    terra::rast()
+  result <- result[[order(terra::time(result))]]
+  
+  # Save individual rasters
+  1:(terra::nlyr(result)) %>%
+    purrr::map(.f = function(i){
+      terra::writeRaster(x = result[[i]], filename = paste0(outf,'/',iso,'_',ssp,'_',gcm,'_',var,'_',periodo,'__',as.character(names(result[[i]])),'.tif'), overwrite = T)
+    })
+  
+  # terra::writeRaster(x = result, filename = paste0(out,'/',iso,'_',ssp,'_',gcm,'_',var,'_',prd[1],'-',prd[2],'.tif'), overwrite = T)
+  
+}
+## --------------------------------------------------------------------------------- ##
+## Parallelization
+## --------------------------------------------------------------------------------- ##
+
+cores <- 5
+
+if(OSys == 'Windows'){
+  plan(cluster, workers = cores, gc = TRUE)
+  isos %>% furrr::future_map(.x = ., .f = bc_delta2)
+  future:::ClusterRegistry("stop")
+  gc(reset = T)
+} else {
+  if(OSys == 'Linux'){
+    plan(multicore, workers = cores, gc = TRUE)
+    isos %>% future.apply::future_lapply(X = ., FUN = bc_delta2)
+    future:::ClusterRegistry("stop")
+    gc(reset = T)
+  }
+}

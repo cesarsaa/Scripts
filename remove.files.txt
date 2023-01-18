@@ -1,0 +1,36 @@
+## --------------------------------------------------------------------------------- ##
+# R options
+g <- gc(reset = T); rm(list = ls()) # Empty garbage collector
+# .rs.restartR()                      # Restart R session
+options(warn = -1, scipen = 999)    # Remove warning alerts and scientific notation
+suppressMessages(library(pacman))
+suppressMessages(pacman::p_load(tidyverse, terra, lubridate, raster, rgdal, rgeos,
+                                stringr, sf, foreach, doSNOW))
+## --------------------------------------------------------------------------------- ##
+root <- "//catalogue/WFP_ClimateRiskPr1/"
+cambio <- function(var, prd, isos, ssp, GCM){
+  
+  pth <- paste0(root, "10.New_Results/bias_corrected/",prd,"/",isos,"/",ssp,"/",GCM)
+  files <- list.files(path = pth,pattern ="1" ,
+                      full.names = TRUE)
+  files <- files[grep(var,files)]
+  
+  lapply(1:length(files) , function(i){
+    file.remove(files)
+     })
+}
+
+
+ssp <- c("ssp245")
+var <- "pr"
+prd <- "2050s"
+GCM <- "MPI-ESM1-2-HR" # EC-Earth3-Veg ACCESS-ESM1-5 MRI-ESM2-0 MPI-ESM1-2-HR
+AFR <- raster::shapefile(paste0(root,'/1.Data/shps/world_shapefile/Africa/africa.shp'))
+isos <- unique(c(AFR@data$ISO3)); rm(AFR)
+isos <- isos[-c(1,3:4,20,34,35,41,43)]
+isos <- c(isos, "SSD" )
+
+lapply(1:length(isos), function(i){
+  cat(paste0("Procesando  ssp: " ,ssp[i], "\n", isos[i], "\n"))
+  cambio(var = var, prd = prd, isos = isos[i], ssp = ssp, GCM = GCM)
+})
